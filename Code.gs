@@ -14,9 +14,10 @@
  *
  * 除了 login 以外，所有動作都必須帶有效的 token（先登入）。
  *
- * 工作表 Equipment_List 欄位：
- *   設備：A 設備編號   B 名稱   C 狀態   D QR Code   E 廠牌
- *   使用者：F 使用者編號   G 姓名   H 職稱   I 狀態   J 密碼
+ * 工作表 Equipment_List 欄位（設備）：
+ *   A 設備編號   B 名稱   C 狀態   D QR Code   E 廠牌
+ * 工作表 使用者名單 欄位（使用者）：
+ *   A 使用者編號   B 姓名   C 職稱   D 狀態   E 密碼
  *
  * 每次借用／歸還成功時，會在「借還紀錄」分頁新增一列（含操作人）。
  * 該分頁不存在時會自動建立。
@@ -25,9 +26,9 @@
 var LIST_SHEET_NAME = "Equipment_List";
 var LOG_SHEET_NAME = "借還紀錄";
 
-// 使用者資料所在的分頁與起始欄（6 = F 欄），依序為：編號、姓名、職稱、狀態、密碼
-var USER_SHEET_NAME = "Equipment_List";
-var USER_START_COL = 6;
+// 使用者資料所在的分頁與起始欄（1 = A 欄），依序為：編號、姓名、職稱、狀態、密碼
+var USER_SHEET_NAME = "使用者名單";
+var USER_START_COL = 1;
 // 狀態欄填入下列任一文字時，該帳號不可登入；空白視為啟用
 var DISABLED_STATUSES = ["不啟用", "停用"];
 
