@@ -7,6 +7,8 @@
  *   驗證碼：  action=captcha                          → 回傳驗證碼編號與圖片（SVG）
  *   登入：    action=login, user=1001, password=****, captchaId=..., captcha=1234
  *                                                     → 回傳 token 與使用者資料
+ *   建立帳號：action=register, user=..., name=..., password=****, captchaId=..., captcha=1234
+ *                                                     → 在「使用者名單」新增一列，狀態為 NEW_USER_STATUS
  *   登出：    action=logout, token=...
  *   目前身分：action=me, token=...
  *   延長登入：action=ping, token=...                  → 使用者有操作時由前台呼叫
@@ -15,7 +17,7 @@
  *   設備清單：action=list, token=...
  *   借還紀錄：action=log, limit=50, token=...
  *
- * 除了 captcha、login 以外，所有動作都必須帶有效的 token（先登入）。
+ * 除了 captcha、login、register 以外，所有動作都必須帶有效的 token（先登入）。
  * 登入後若超過 SESSION_SECONDS 沒有操作，token 自動失效。
  *
  * 工作表 Equipment_List 欄位（設備）：
@@ -34,7 +36,14 @@ var LOG_SHEET_NAME = "借還紀錄";
 var USER_SHEET_NAME = "使用者名單";
 var USER_START_COL = 1;
 // 狀態欄填入下列任一文字時，該帳號不可登入；空白視為啟用
-var DISABLED_STATUSES = ["不啟用", "停用"];
+var DISABLED_STATUSES = ["不啟用", "停用", "待審核"];
+
+// 使用者自行建立帳號時寫入的狀態與職稱。
+// 預設「待審核」：管理員到「使用者名單」把該列的狀態清空後，帳號才能登入。
+// 若希望建立後立刻可以登入，把 NEW_USER_STATUS 改成 ""（任何人都能自行取得帳號，請斟酌）。
+var NEW_USER_STATUS = "待審核";
+var NEW_USER_ROLE = "teacher";
+var MAX_REGISTER_PER_HOUR = 20;   // 每小時最多可建立幾個帳號，避免被大量灌入
 
 // 沒有操作多久後 token 失效。前台在 5 分鐘無操作時會自動登出（auth.js 的 IDLE_MINUTES），
 // 這裡多留 1 分鐘緩衝，避免前台還沒登出、後台先失效。
@@ -76,6 +85,7 @@ function handle(p) {
 
   if (action === "captcha") return createCaptcha();
   if (action === "login")   return login(p.user, p.password, p.captchaId, p.captcha);
+  if (action === "register") return register(p.user, p.name, p.password, p.captchaId, p.captcha);
   if (action === "logout")  return logout(p.token);
 
   // ---- 以下動作都需要先登入 ----
@@ -266,6 +276,70 @@ function login(userId, password, captchaId, captcha) {
   var token = (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, "");
   cache.put("sess_" + token, user.id, SESSION_SECONDS);
   return { ok: true, message: "登入成功", token: token, user: publicUser(user) };
+}
+
+/** 以 = + - @ ' 開頭的文字寫進試算表可能被當成公式，一律不接受 */
+function looksLikeFormula(text) {
+  return /^[=+\-@']/.test(text);
+}
+
+/** 建立帳號：在「使用者名單」最後新增一列 */
+function register(userId, name, password, captchaId, captcha) {
+  userId = String(userId == null ? "" : userId).trim();
+  name = String(name == null ? "" : name).trim();
+  password = String(password == null ? "" : password);
+  if (userId === "" || name === "" || password === "") {
+    return { ok: false, code: "bad_request", message: "請填寫帳號、姓名與密碼" };
+  }
+  if (!checkCaptcha(captchaId, captcha)) {
+    return { ok: false, code: "bad_captcha", message: "驗證碼錯誤或已過期，請重新輸入" };
+  }
+  if (!/^[A-Za-z0-9]{4,20}$/.test(userId)) {
+    return { ok: false, code: "bad_id", message: "帳號須為 4 到 20 個英文字母或數字" };
+  }
+  if (name.length > 20 || /[\x00-\x1f<>]/.test(name) || looksLikeFormula(name)) {
+    return { ok: false, code: "bad_name", message: "姓名最多 20 個字，不可包含 < >，也不可以 = + - @ ' 開頭" };
+  }
+  if (password.length < 4 || password.length > 50 || password !== password.trim() ||
+      /[\x00-\x1f]/.test(password) || looksLikeFormula(password)) {
+    return { ok: false, code: "bad_password", message: "密碼須為 4 到 50 個字元，前後不可有空白，也不可以 = + - @ ' 開頭" };
+  }
+
+  var cache = CacheService.getScriptCache();
+  var created = parseInt(cache.get("reg_count"), 10) || 0;
+  if (created >= MAX_REGISTER_PER_HOUR) {
+    return { ok: false, code: "busy", message: "目前建立帳號的人數過多，請稍後再試" };
+  }
+
+  // 鎖定後再檢查與寫入，避免兩個人同時用同一個帳號建立
+  var lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(USER_SHEET_NAME);
+    if (!sheet) {
+      return { ok: false, code: "error", message: "找不到「" + USER_SHEET_NAME + "」分頁，請洽管理員" };
+    }
+    var users = getUsers();
+    for (var i = 0; i < users.length; i++) {
+      if (users[i].id.toLowerCase() === userId.toLowerCase()) {
+        return { ok: false, code: "exists", message: "此帳號已被使用，請換一個" };
+      }
+    }
+    var row = Math.max(sheet.getLastRow() + 1, 2);
+    var range = sheet.getRange(row, USER_START_COL, 1, 5);
+    range.setNumberFormat("@");   // 先設成純文字，「0123」這類帳號或密碼才不會被存成數字
+    range.setValues([[userId, name, NEW_USER_ROLE, NEW_USER_STATUS, password]]);
+  } finally {
+    lock.releaseLock();
+  }
+  cache.put("reg_count", String(created + 1), 3600);
+
+  var pending = DISABLED_STATUSES.indexOf(NEW_USER_STATUS) !== -1;
+  return {
+    ok: true,
+    pending: pending,
+    message: pending ? "帳號已建立，目前狀態為「" + NEW_USER_STATUS + "」。\n請等管理員啟用後再登入。" : "帳號已建立，請登入。"
+  };
 }
 
 function logout(token) {

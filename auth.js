@@ -1,6 +1,6 @@
 /**
- * 共用模組：後台網址、登入狀態、API 呼叫
- * login.html、index.html、status.html 都會載入這個檔案。
+ * 共用模組：後台網址、登入狀態、閒置自動登出、驗證碼、API 呼叫
+ * login.html、register.html、index.html、status.html 都會載入這個檔案。
  */
 
 // ★★★ 請替換成您的 GAS 網頁應用程式網址（全站只需要改這一處）★★★
@@ -146,6 +146,36 @@ async function api(params, withToken = true) {
         throw new Error(data.message || "請先登入");
     }
     return data;
+}
+
+/**
+ * 驗證碼元件，登入頁與建立帳號頁共用。
+ * 向後台要一張驗證碼圖片並顯示；答案只存在後台，前台只拿到編號與圖片。
+ * 回傳 { id, reload() }：id 是目前這張驗證碼的編號，reload() 換一張新的。
+ */
+function createCaptchaBox(img, input, refreshBtn, showError) {
+    const box = { id: "", reload: reload };
+
+    async function reload() {
+        refreshBtn.disabled = true;
+        box.id = "";
+        input.value = "";
+        img.removeAttribute("src");
+        try {
+            const data = await api({ action: "captcha" }, false);
+            if (!data.ok || !data.id || !data.svg) throw new Error(data.message || "無法取得驗證碼");
+            box.id = data.id;
+            // 以圖片方式顯示，SVG 內容不會被當成網頁的一部分執行
+            img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(data.svg);
+        } catch (err) {
+            console.error(err);
+            showError("無法取得驗證碼，請按「換一張」再試。");
+        }
+        refreshBtn.disabled = false;
+    }
+
+    refreshBtn.addEventListener("click", () => { showError(""); reload(); });
+    return box;
 }
 
 async function logout() {

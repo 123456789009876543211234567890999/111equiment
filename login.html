@@ -23,6 +23,7 @@
         #notice { margin-bottom: 14px; padding: 10px; border-radius: 6px; background: #fff3cd; color: #664d03; font-size: 14px; text-align: center; }
         #notice:empty { display: none; }
         .hint { margin-top: 14px; font-size: 13px; color: #888; text-align: center; }
+        .hint a { color: #0d6efd; font-size: 15px; }
     </style>
 </head>
 <body>
@@ -45,6 +46,7 @@
         </div>
         <button id="submit-btn" type="submit">登入</button>
         <div id="msg"></div>
+        <div class="hint">還沒有帳號？<a href="register.html">建立帳號</a></div>
         <div class="hint">登入後若 5 分鐘沒有操作，系統會自動登出。</div>
     </form>
 
@@ -53,6 +55,9 @@
         const query = new URLSearchParams(location.search);
         const nextParam = query.get("next");
         const nextPage = PAGES.includes(nextParam) ? nextParam : "index.html";
+        if (query.get("registered") === "1") {
+            document.getElementById('notice').innerText = "帳號已建立，請登入。";
+        }
         if (query.get("reason") === "idle") {
             document.getElementById('notice').innerText = "已超過 " + IDLE_MINUTES + " 分鐘沒有操作，系統已自動登出，請重新登入。";
         }
@@ -63,32 +68,11 @@
         const form = document.getElementById('login-form');
         const btn = document.getElementById('submit-btn');
         const msg = document.getElementById('msg');
-        const captchaImg = document.getElementById('captcha-img');
         const captchaInput = document.getElementById('captcha');
-        const captchaRefresh = document.getElementById('captcha-refresh');
-        let captchaId = "";
-
-        // 向後台要一張新的驗證碼。答案只存在後台，前台只拿到編號與圖片。
-        async function loadCaptcha() {
-            captchaRefresh.disabled = true;
-            captchaId = "";
-            captchaInput.value = "";
-            captchaImg.removeAttribute("src");
-            try {
-                const data = await api({ action: "captcha" }, false);
-                if (!data.ok || !data.id || !data.svg) throw new Error(data.message || "無法取得驗證碼");
-                captchaId = data.id;
-                // 以圖片方式顯示，SVG 內容不會被當成網頁的一部分執行
-                captchaImg.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(data.svg);
-            } catch (err) {
-                console.error(err);
-                msg.style.color = "#dc3545";
-                msg.innerText = "無法取得驗證碼，請按「換一張」再試。";
-            }
-            captchaRefresh.disabled = false;
-        }
-        captchaRefresh.addEventListener('click', () => { msg.innerText = ""; loadCaptcha(); });
-        if (!getSession()) loadCaptcha();
+        const captchaBox = createCaptchaBox(
+            document.getElementById('captcha-img'), captchaInput, document.getElementById('captcha-refresh'),
+            text => { msg.style.color = "#dc3545"; msg.innerText = text; });
+        if (!getSession()) captchaBox.reload();
 
         form.addEventListener('submit', async (ev) => {
             ev.preventDefault();
@@ -100,7 +84,7 @@
                     action: "login",
                     user: document.getElementById('user').value.trim(),
                     password: document.getElementById('password').value,
-                    captchaId: captchaId,
+                    captchaId: captchaBox.id,
                     captcha: captchaInput.value.trim()
                 }, false);
                 if (data.ok) {
@@ -109,7 +93,7 @@
                     return;
                 }
                 // 每張驗證碼只能用一次，登入失敗後要換一張
-                await loadCaptcha();
+                await captchaBox.reload();
                 msg.style.color = "#dc3545";
                 msg.innerText = data.message || "登入失敗";
                 if (data.code === "bad_captcha") captchaInput.focus();
