@@ -4,15 +4,19 @@
  * 所有請求都回傳 JSON：{ ok: true/false, message: "...", ... }
  * 前台以 POST 傳送 JSON；也可用 GET 帶相同參數（方便測試）。
  *
- *   登入：    action=login, user=1001, password=****  → 回傳 token 與使用者資料
+ *   驗證碼：  action=captcha                          → 回傳驗證碼編號與圖片（SVG）
+ *   登入：    action=login, user=1001, password=****, captchaId=..., captcha=1234
+ *                                                     → 回傳 token 與使用者資料
  *   登出：    action=logout, token=...
  *   目前身分：action=me, token=...
+ *   延長登入：action=ping, token=...                  → 使用者有操作時由前台呼叫
  *   借用：    action=borrow, id=1001, token=...       → C 欄「可借用」改為「借出中」
  *   歸還：    action=return, id=1001, token=...       → C 欄「借出中」改為「可借用」
  *   設備清單：action=list, token=...
  *   借還紀錄：action=log, limit=50, token=...
  *
- * 除了 login 以外，所有動作都必須帶有效的 token（先登入）。
+ * 除了 captcha、login 以外，所有動作都必須帶有效的 token（先登入）。
+ * 登入後若超過 SESSION_SECONDS 沒有操作，token 自動失效。
  *
  * 工作表 Equipment_List 欄位（設備）：
  *   A 設備編號   B 名稱   C 狀態   D QR Code   E 廠牌
@@ -32,7 +36,11 @@ var USER_START_COL = 1;
 // 狀態欄填入下列任一文字時，該帳號不可登入；空白視為啟用
 var DISABLED_STATUSES = ["不啟用", "停用"];
 
-var SESSION_SECONDS = 21600;   // 登入有效時間：6 小時（每次操作會自動延長）
+// 沒有操作多久後 token 失效。前台在 5 分鐘無操作時會自動登出（auth.js 的 IDLE_MINUTES），
+// 這裡多留 1 分鐘緩衝，避免前台還沒登出、後台先失效。
+var SESSION_SECONDS = 360;
+var CAPTCHA_SECONDS = 300;     // 驗證碼有效時間：5 分鐘
+var CAPTCHA_LENGTH = 4;        // 驗證碼位數
 var MAX_LOGIN_FAILS = 5;       // 連續輸入錯誤幾次後鎖定
 var LOCK_SECONDS = 600;        // 鎖定時間：10 分鐘
 
@@ -66,13 +74,17 @@ function respond(params) {
 function handle(p) {
   var action = String(p.action || "borrow").toLowerCase();
 
-  if (action === "login")  return login(p.user, p.password);
-  if (action === "logout") return logout(p.token);
+  if (action === "captcha") return createCaptcha();
+  if (action === "login")   return login(p.user, p.password, p.captchaId, p.captcha);
+  if (action === "logout")  return logout(p.token);
 
   // ---- 以下動作都需要先登入 ----
-  var user = getSessionUser(p.token);
+  // 只有使用者真的有操作時才延長登入時間；總覽頁的自動更新（list、log）不算操作
+  var renew = (action === "ping" || action === "me" || action === "borrow" || action === "return");
+  var user = getSessionUser(p.token, renew);
   if (!user) return { ok: false, code: "auth", message: "請先登入" };
 
+  if (action === "ping") return { ok: true };
   if (action === "me")   return { ok: true, user: user };
   if (action === "list") return getEquipmentList();
   if (action === "log")  return getLog(parseInt(p.limit, 10) || 50);
@@ -85,6 +97,100 @@ function handle(p) {
 function jsonOutput(obj) {
   return ContentService.createTextOutput(JSON.stringify(obj))
     .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ============================ 圖形驗證碼 ============================
+
+/** 產生一組驗證碼：答案存在後台快取，只把編號與圖片回傳給前台 */
+function createCaptcha() {
+  var code = "";
+  for (var i = 0; i < CAPTCHA_LENGTH; i++) code += Math.floor(Math.random() * 10);
+  var id = Utilities.getUuid().replace(/-/g, "");
+  CacheService.getScriptCache().put("cap_" + id, code, CAPTCHA_SECONDS);
+  return { ok: true, id: id, svg: drawCaptcha(code) };
+}
+
+/** 檢查驗證碼。每組驗證碼只能用一次，不論對錯都會作廢。 */
+function checkCaptcha(captchaId, answer) {
+  captchaId = String(captchaId == null ? "" : captchaId);
+  answer = String(answer == null ? "" : answer).trim();
+  if (captchaId === "" || captchaId.length > 64 || answer === "") return false;
+
+  var cache = CacheService.getScriptCache();
+  var key = "cap_" + captchaId;
+  var code = cache.get(key);
+  if (!code) return false;
+  cache.remove(key);
+  return code === answer;
+}
+
+// 數字的筆畫：座標為寬 4、高 6 的格子，每個陣列是一條連續的線
+var DIGIT_STROKES = {
+  "0": [[[0, 0], [4, 0], [4, 6], [0, 6], [0, 0]]],
+  "1": [[[1, 1.4], [2.4, 0], [2.4, 6]]],
+  "2": [[[0, 0], [4, 0], [4, 3], [0, 3], [0, 6], [4, 6]]],
+  "3": [[[0, 0], [4, 0], [4, 6], [0, 6]], [[0.8, 3], [4, 3]]],
+  "4": [[[0, 0], [0, 3], [4, 3]], [[4, 0], [4, 6]]],
+  "5": [[[4, 0], [0, 0], [0, 3], [4, 3], [4, 6], [0, 6]]],
+  "6": [[[4, 0], [0, 0], [0, 6], [4, 6], [4, 3], [0, 3]]],
+  "7": [[[0, 0], [4, 0], [4, 6]]],
+  "8": [[[0, 0], [4, 0], [4, 6], [0, 6], [0, 0]], [[0, 3], [4, 3]]],
+  "9": [[[4, 3], [0, 3], [0, 0], [4, 0], [4, 6], [0, 6]]]
+};
+var CAPTCHA_COLORS = ["#1b4f9c", "#8a2a2a", "#1f6b3a", "#5b2a86", "#7a4a00", "#333333"];
+
+function rnd(min, max) {
+  return min + Math.random() * (max - min);
+}
+
+/**
+ * 把驗證碼畫成 SVG 圖片。數字以線條畫出（圖片裡沒有文字），
+ * 每個數字的位置、大小、角度、筆畫都隨機偏移，並加上干擾線與雜點。
+ */
+function drawCaptcha(code) {
+  var W = 160, H = 60;
+  var parts = ['<svg xmlns="http://www.w3.org/2000/svg" width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '">',
+               '<rect width="' + W + '" height="' + H + '" fill="#f1f3f5"/>'];
+  var i, j, k;
+
+  // 雜點
+  for (i = 0; i < 40; i++) {
+    parts.push('<circle cx="' + rnd(0, W).toFixed(1) + '" cy="' + rnd(0, H).toFixed(1) + '" r="' + rnd(0.6, 1.4).toFixed(1) +
+               '" fill="' + CAPTCHA_COLORS[Math.floor(rnd(0, CAPTCHA_COLORS.length))] + '" opacity="0.5"/>');
+  }
+
+  // 數字
+  var slot = W / code.length;
+  for (i = 0; i < code.length; i++) {
+    var strokes = DIGIT_STROKES[code.charAt(i)];
+    var cx = slot * (i + 0.5) + rnd(-4, 4);
+    var cy = H / 2 + rnd(-5, 5);
+    var scale = rnd(5.2, 6.4);
+    var angle = rnd(-12, 12) * Math.PI / 180;
+    var cos = Math.cos(angle), sin = Math.sin(angle);
+    var d = "";
+    for (j = 0; j < strokes.length; j++) {
+      for (k = 0; k < strokes[j].length; k++) {
+        var x = (strokes[j][k][0] - 2 + rnd(-0.22, 0.22)) * scale;
+        var y = (strokes[j][k][1] - 3 + rnd(-0.22, 0.22)) * scale;
+        d += (k === 0 ? "M" : "L") + (cx + x * cos - y * sin).toFixed(1) + " " + (cy + x * sin + y * cos).toFixed(1);
+      }
+    }
+    parts.push('<path d="' + d + '" fill="none" stroke="' + CAPTCHA_COLORS[Math.floor(rnd(0, CAPTCHA_COLORS.length))] +
+               '" stroke-width="' + rnd(2.6, 3.4).toFixed(1) + '" stroke-linecap="round" stroke-linejoin="round"/>');
+  }
+
+  // 干擾線（畫在數字上面）
+  for (i = 0; i < 3; i++) {
+    parts.push('<path d="M' + rnd(0, W * 0.3).toFixed(1) + ' ' + rnd(0, H).toFixed(1) +
+               'Q' + rnd(W * 0.3, W * 0.7).toFixed(1) + ' ' + rnd(-10, H + 10).toFixed(1) +
+               ' ' + rnd(W * 0.7, W).toFixed(1) + ' ' + rnd(0, H).toFixed(1) +
+               '" fill="none" stroke="' + CAPTCHA_COLORS[Math.floor(rnd(0, CAPTCHA_COLORS.length))] +
+               '" stroke-width="' + rnd(0.9, 1.3).toFixed(1) + '" opacity="0.55"/>');
+  }
+
+  parts.push('</svg>');
+  return parts.join("");
 }
 
 // ============================ 登入／登出 ============================
@@ -126,11 +232,15 @@ function publicUser(u) {
   return { id: u.id, name: u.name, role: u.role };
 }
 
-function login(userId, password) {
+function login(userId, password, captchaId, captcha) {
   userId = String(userId == null ? "" : userId).trim();
   password = String(password == null ? "" : password);
   if (userId === "" || password === "") {
     return { ok: false, code: "bad_request", message: "請輸入帳號與密碼" };
+  }
+  // 先檢查驗證碼；錯了就不會去比對密碼
+  if (!checkCaptcha(captchaId, captcha)) {
+    return { ok: false, code: "bad_captcha", message: "驗證碼錯誤或已過期，請重新輸入" };
   }
   if (userId.length > 50 || password.length > 100) {
     return { ok: false, code: "bad_login", message: "帳號或密碼錯誤" };
@@ -164,8 +274,11 @@ function logout(token) {
   return { ok: true, message: "已登出" };
 }
 
-/** 由 token 取得登入中的使用者；token 無效、過期或帳號已停用時回傳 null */
-function getSessionUser(token) {
+/**
+ * 由 token 取得登入中的使用者；token 無效、過期或帳號已停用時回傳 null。
+ * renew 為 true 時重新計算有效時間。
+ */
+function getSessionUser(token, renew) {
   token = String(token || "");
   if (token === "" || token.length > 100) return null;
 
@@ -179,7 +292,7 @@ function getSessionUser(token) {
     cache.remove(key);
     return null;
   }
-  cache.put(key, user.id, SESSION_SECONDS); // 有操作就延長登入時間
+  if (renew) cache.put(key, user.id, SESSION_SECONDS);
   return publicUser(user);
 }
 
