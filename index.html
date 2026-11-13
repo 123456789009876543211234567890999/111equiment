@@ -85,6 +85,7 @@
         function onScanSuccess(decodedText) {
             if (isProcessing) return;
             isProcessing = true;
+            markActive();   // 掃描成功算一次操作，重新計算閒置時間
 
             // 若 QR Code 內容是 quickchart 網址，只取 text= 後面的編號
             if (decodedText.includes("text=")) {

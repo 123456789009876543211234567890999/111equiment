@@ -11,29 +11,51 @@
         .box { max-width: 360px; margin: 40px auto 0; padding: 24px 20px; background: #fff; border-radius: 10px; box-shadow: 0 1px 6px rgba(0,0,0,.1); }
         h2 { text-align: center; margin: 0 0 20px; }
         label { display: block; margin-bottom: 14px; font-size: 15px; color: #555; }
+        .field { margin-bottom: 14px; }
+        .field label { margin-bottom: 0; }
         input { display: block; width: 100%; margin-top: 6px; padding: 10px; font-size: 18px; border: 1px solid #ccc; border-radius: 6px; }
         button { width: 100%; padding: 12px; font-size: 18px; font-weight: bold; border: none; border-radius: 8px; background: #0d6efd; color: #fff; cursor: pointer; }
         button:disabled { background: #9bb8e8; }
         #msg { min-height: 24px; margin-top: 14px; text-align: center; font-weight: bold; color: #dc3545; white-space: pre-wrap; }
+        .captcha-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+        #captcha-img { width: 160px; height: 60px; border: 1px solid #ccc; border-radius: 6px; background: #f1f3f5; }
+        #captcha-refresh { width: auto; padding: 8px 12px; font-size: 14px; font-weight: normal; background: #6c757d; }
+        #notice { margin-bottom: 14px; padding: 10px; border-radius: 6px; background: #fff3cd; color: #664d03; font-size: 14px; text-align: center; }
+        #notice:empty { display: none; }
+        .hint { margin-top: 14px; font-size: 13px; color: #888; text-align: center; }
     </style>
 </head>
 <body>
     <form class="box" id="login-form" autocomplete="on">
         <h2>🔐 設備借用系統登入</h2>
+        <div id="notice"></div>
         <label>帳號（使用者編號）
             <input id="user" name="username" type="text" inputmode="numeric" autocomplete="username" required autofocus>
         </label>
         <label>密碼
             <input id="password" name="password" type="password" autocomplete="current-password" required>
         </label>
+        <div class="field">
+            <label for="captcha">驗證碼（請輸入圖片中的 4 個數字）</label>
+            <div class="captcha-row">
+                <img id="captcha-img" alt="驗證碼圖片">
+                <button id="captcha-refresh" type="button">🔄 換一張</button>
+            </div>
+            <input id="captcha" name="captcha" type="text" inputmode="numeric" maxlength="4" autocomplete="off" required>
+        </div>
         <button id="submit-btn" type="submit">登入</button>
         <div id="msg"></div>
+        <div class="hint">登入後若 5 分鐘沒有操作，系統會自動登出。</div>
     </form>
 
     <script>
         // 登入後要前往的頁面，只接受本系統的頁面
-        const nextParam = new URLSearchParams(location.search).get("next");
+        const query = new URLSearchParams(location.search);
+        const nextParam = query.get("next");
         const nextPage = PAGES.includes(nextParam) ? nextParam : "index.html";
+        if (query.get("reason") === "idle") {
+            document.getElementById('notice').innerText = "已超過 " + IDLE_MINUTES + " 分鐘沒有操作，系統已自動登出，請重新登入。";
+        }
 
         // 已經登入就直接前往
         if (getSession()) location.replace(nextPage);
@@ -41,6 +63,32 @@
         const form = document.getElementById('login-form');
         const btn = document.getElementById('submit-btn');
         const msg = document.getElementById('msg');
+        const captchaImg = document.getElementById('captcha-img');
+        const captchaInput = document.getElementById('captcha');
+        const captchaRefresh = document.getElementById('captcha-refresh');
+        let captchaId = "";
+
+        // 向後台要一張新的驗證碼。答案只存在後台，前台只拿到編號與圖片。
+        async function loadCaptcha() {
+            captchaRefresh.disabled = true;
+            captchaId = "";
+            captchaInput.value = "";
+            captchaImg.removeAttribute("src");
+            try {
+                const data = await api({ action: "captcha" }, false);
+                if (!data.ok || !data.id || !data.svg) throw new Error(data.message || "無法取得驗證碼");
+                captchaId = data.id;
+                // 以圖片方式顯示，SVG 內容不會被當成網頁的一部分執行
+                captchaImg.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(data.svg);
+            } catch (err) {
+                console.error(err);
+                msg.style.color = "#dc3545";
+                msg.innerText = "無法取得驗證碼，請按「換一張」再試。";
+            }
+            captchaRefresh.disabled = false;
+        }
+        captchaRefresh.addEventListener('click', () => { msg.innerText = ""; loadCaptcha(); });
+        if (!getSession()) loadCaptcha();
 
         form.addEventListener('submit', async (ev) => {
             ev.preventDefault();
@@ -51,15 +99,20 @@
                 const data = await api({
                     action: "login",
                     user: document.getElementById('user').value.trim(),
-                    password: document.getElementById('password').value
+                    password: document.getElementById('password').value,
+                    captchaId: captchaId,
+                    captcha: captchaInput.value.trim()
                 }, false);
                 if (data.ok) {
                     setSession({ token: data.token, user: data.user });
                     location.replace(nextPage);
                     return;
                 }
+                // 每張驗證碼只能用一次，登入失敗後要換一張
+                await loadCaptcha();
                 msg.style.color = "#dc3545";
                 msg.innerText = data.message || "登入失敗";
+                if (data.code === "bad_captcha") captchaInput.focus();
             } catch (err) {
                 console.error(err);
                 msg.style.color = "#dc3545";
