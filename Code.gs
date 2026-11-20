@@ -14,8 +14,9 @@
  *   延長登入：action=ping, token=...                  → 使用者有操作時由前台呼叫
  *   借用：    action=borrow, id=1001, token=...       → C 欄「可借用」改為「借出中」
  *   歸還：    action=return, id=1001, token=...       → C 欄「借出中」改為「可借用」
+ *                                                       （只有借出這台設備的人可以歸還）
  *   設備清單：action=list, token=...
- *   借還紀錄：action=log, limit=50, token=...
+ *   借還紀錄：action=log, limit=50, token=...        → 只回傳自己的紀錄（管理員職稱可看全部）
  *
  * 除了 captcha、login、register 以外，所有動作都必須帶有效的 token（先登入）。
  * 登入後若超過 SESSION_SECONDS 沒有操作，token 自動失效。
@@ -44,6 +45,15 @@ var DISABLED_STATUSES = ["不啟用", "停用", "待審核"];
 var NEW_USER_STATUS = "待審核";
 var NEW_USER_ROLE = "teacher";
 var MAX_REGISTER_PER_HOUR = 20;   // 每小時最多可建立幾個帳號，避免被大量灌入
+
+// 管理員職稱。「使用者名單」的職稱欄填這些文字的人（英文不分大小寫）：
+//   1. 可以代為歸還任何設備（一般使用者只能歸還自己借的），例如借用人請假或離職時
+//   2. 可以看到所有人的借還紀錄（一般使用者只能看到自己的）
+var ADMIN_ROLES = ["admin", "管理員"];
+
+// 別人來歸還而被拒絕時，訊息中是否顯示借用人的姓名。
+// true：顯示「這台設備是由 某某 借出的」，方便找人；false：只顯示「由其他人借出」。
+var SHOW_BORROWER_NAME = true;
 
 // 沒有操作多久後 token 失效。前台在 5 分鐘無操作時會自動登出（auth.js 的 IDLE_MINUTES），
 // 這裡多留 1 分鐘緩衝，避免前台還沒登出、後台先失效。
@@ -97,7 +107,7 @@ function handle(p) {
   if (action === "ping") return { ok: true };
   if (action === "me")   return { ok: true, user: user };
   if (action === "list") return getEquipmentList();
-  if (action === "log")  return getLog(parseInt(p.limit, 10) || 50);
+  if (action === "log")  return getLog(parseInt(p.limit, 10) || 50, user);
   if (action === "borrow" || action === "return") return changeStatus(p.id, action, user);
 
   return { ok: false, code: "bad_action", message: "未知的動作：" + action };
@@ -378,6 +388,17 @@ function changeStatus(equipmentId, action, user) {
     return { ok: false, code: "bad_request", message: "請提供設備編號" };
   }
 
+  // 一次只處理一筆借還，避免兩個人同時掃同一台都成功
+  var lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    return changeStatusLocked(equipmentId, action, user);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function changeStatusLocked(equipmentId, action, user) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var sheet = ss.getSheetByName(LIST_SHEET_NAME);
   var data = sheet.getDataRange().getValues();
@@ -404,11 +425,49 @@ function changeStatus(equipmentId, action, user) {
     if (currentStatus !== "借出中") {
       return { ok: false, code: "bad_status", message: "歸還失敗！該設備目前狀態為：" + currentStatus + "（未在借出狀態）" };
     }
+    // 只有借出人本人（或管理員職稱）可以歸還
+    var borrower = findBorrower(ss, equipmentId);
+    if (borrower && borrower.id !== user.id && !isAdmin(user)) {
+      var who = SHOW_BORROWER_NAME ? " " + (borrower.name || borrower.id) + " " : "其他人";
+      return {
+        ok: false,
+        code: "not_borrower",
+        message: "歸還失敗！\n這台設備是由" + who + "借出的，\n只能由借用人本人歸還。"
+      };
+    }
     statusCell.setValue("可借用");
     appendLog(ss, equipmentId, eqName, eqBrand, "歸還", "可借用", user);
     return { ok: true, message: "歸還成功！\n" + eqBrand + " " + eqName + "\n歸還人：" + user.name + "\n狀態已更新為：可借用" };
   }
   return { ok: false, code: "not_found", message: "找不到設備編號：" + equipmentId };
+}
+
+/**
+ * 找出某台設備目前的借用人：看「借還紀錄」中這台設備最後一筆紀錄。
+ * 最後一筆是「借用」且有記下使用者時，回傳 { id, name }。
+ * 找不到紀錄、或該筆紀錄沒有使用者（加入登入功能前借出的）時回傳 null，此時任何已登入的人都可以歸還。
+ */
+function findBorrower(ss, equipmentId) {
+  var logSheet = ss.getSheetByName(LOG_SHEET_NAME);
+  if (!logSheet || logSheet.getLastRow() < 2) return null;
+
+  var data = logSheet.getRange(2, 1, logSheet.getLastRow() - 1, LOG_HEADERS.length).getDisplayValues();
+  for (var i = data.length - 1; i >= 0; i--) {
+    if (String(data[i][1]).trim() !== equipmentId) continue;
+    if (String(data[i][4]).trim() !== "借用") return null;
+    var id = String(data[i][6]).trim();
+    return id === "" ? null : { id: id, name: String(data[i][7]).trim() };
+  }
+  return null;
+}
+
+/** 職稱在 ADMIN_ROLES 中的使用者是管理員：可以代為歸還任何設備、可以看所有人的紀錄 */
+function isAdmin(user) {
+  var role = String(user.role || "").trim().toLowerCase();
+  for (var i = 0; i < ADMIN_ROLES.length; i++) {
+    if (role !== "" && role === String(ADMIN_ROLES[i]).toLowerCase()) return true;
+  }
+  return false;
 }
 
 // ============================ 查詢 ============================
@@ -431,19 +490,25 @@ function getEquipmentList() {
   return { ok: true, updatedAt: formatTime(new Date()), items: items };
 }
 
-/** 取得最近 N 筆借還紀錄（新到舊） */
-function getLog(limit) {
+/**
+ * 取得最近 N 筆借還紀錄（新到舊）。
+ * 一般使用者只會拿到自己的紀錄；管理員職稱拿到所有人的紀錄。
+ * 回傳的 scope 為 "mine" 或 "all"，前台用來決定標題。
+ */
+function getLog(limit, user) {
+  var all = isAdmin(user);
+  var scope = all ? "all" : "mine";
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var logSheet = ss.getSheetByName(LOG_SHEET_NAME);
-  if (!logSheet || logSheet.getLastRow() < 2) return { ok: true, records: [] };
+  if (!logSheet || logSheet.getLastRow() < 2) return { ok: true, scope: scope, records: [] };
 
-  var lastRow = logSheet.getLastRow();
-  var count = Math.min(Math.max(limit, 1), 500, lastRow - 1);
-  var startRow = lastRow - count + 1;
-  var data = logSheet.getRange(startRow, 1, count, LOG_HEADERS.length).getValues();
+  limit = Math.min(Math.max(limit, 1), 500);
+  var data = logSheet.getRange(2, 1, logSheet.getLastRow() - 1, LOG_HEADERS.length).getValues();
 
   var records = [];
-  for (var i = data.length - 1; i >= 0; i--) {
+  for (var i = data.length - 1; i >= 0 && records.length < limit; i--) {
+    var userId = String(data[i][6]).trim();
+    if (!all && userId !== user.id) continue;   // 不是自己的紀錄（含沒有記下使用者的舊紀錄）就跳過
     records.push({
       time: data[i][0] instanceof Date ? formatTime(data[i][0]) : String(data[i][0]),
       id: String(data[i][1]),
@@ -451,11 +516,11 @@ function getLog(limit) {
       brand: String(data[i][3]),
       action: String(data[i][4]),
       status: String(data[i][5]),
-      userId: String(data[i][6]),
+      userId: userId,
       userName: String(data[i][7])
     });
   }
-  return { ok: true, records: records };
+  return { ok: true, scope: scope, records: records };
 }
 
 /** 在「借還紀錄」分頁新增一列。分頁不存在時自動建立並寫入標題列。 */
@@ -470,8 +535,14 @@ function appendLog(ss, equipmentId, eqName, eqBrand, actionText, newStatus, user
   // 標題列（舊的紀錄分頁只有 6 欄時，會補上「使用者編號」「使用者」兩欄）
   logSheet.getRange(1, 1, 1, LOG_HEADERS.length).setValues([LOG_HEADERS]).setFontWeight("bold");
 
-  logSheet.appendRow([new Date(), String(equipmentId), eqName, eqBrand, actionText, newStatus, user.id, user.name]);
-  logSheet.getRange(logSheet.getLastRow(), 1).setNumberFormat("yyyy/MM/dd HH:mm:ss");
+  // 設備編號與使用者編號先設成純文字再寫入，「0123」這類編號才不會被存成數字 123，
+  // 否則之後比對借用人時會對不上
+  var row = logSheet.getLastRow() + 1;
+  logSheet.getRange(row, 2).setNumberFormat("@");
+  logSheet.getRange(row, 7).setNumberFormat("@");
+  logSheet.getRange(row, 1, 1, LOG_HEADERS.length)
+    .setValues([[new Date(), String(equipmentId), eqName, eqBrand, actionText, newStatus, user.id, user.name]]);
+  logSheet.getRange(row, 1).setNumberFormat("yyyy/MM/dd HH:mm:ss");
 }
 
 function formatTime(d) {

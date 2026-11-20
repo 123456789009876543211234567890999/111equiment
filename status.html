@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>設備狀態總覽</title>
-    <script src="auth.js"></script>
+    <script src="auth.js?v=6"></script>
     <style>
         * { box-sizing: border-box; }
         body { font-family: sans-serif; margin: 0; padding: 16px; background: #f8f9fa; color: #222; }
@@ -81,7 +81,7 @@
     </div>
 
     <div class="section">
-        <h3>最近借還紀錄</h3>
+        <h3 id="log-title">借還紀錄</h3>
         <table>
             <thead><tr><th>時間</th><th>編號</th><th>名稱</th><th>動作</th><th>使用者</th><th class="hide-sm">更新後狀態</th></tr></thead>
             <tbody id="log-body"><tr><td colspan="6" class="empty">載入中...</td></tr></tbody>
@@ -126,10 +126,13 @@
             ).join('');
         }
 
-        function renderLog(records) {
+        // scope 為 "mine" 時後台只回傳自己的紀錄；管理員職稱會拿到 "all"
+        function renderLog(records, scope) {
+            const mine = scope !== "all";
+            document.getElementById('log-title').innerText = mine ? "我的借還紀錄" : "最近借還紀錄（所有人）";
             const body = document.getElementById('log-body');
             if (!records.length) {
-                body.innerHTML = '<tr><td colspan="6" class="empty">尚無紀錄</td></tr>';
+                body.innerHTML = '<tr><td colspan="6" class="empty">' + (mine ? "你還沒有借還紀錄" : "尚無紀錄") + '</td></tr>';
                 return;
             }
             body.innerHTML = records.map(r => {
@@ -156,7 +159,7 @@
                 document.getElementById('n-out').innerText = items.filter(i => i.status === "借出中").length;
                 document.getElementById('updated').innerText = "最後更新：" + (listRes.updatedAt || new Date().toLocaleString());
                 renderList();
-                renderLog(logRes.records || []);
+                renderLog(logRes.records || [], logRes.scope);
             } catch (err) {
                 console.error(err);
                 document.getElementById('error').innerText = "讀取資料失敗，請確認 GAS 網址與部署狀態。";
