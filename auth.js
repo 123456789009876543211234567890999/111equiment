@@ -84,6 +84,7 @@ function markActive() {
     if (isIdleExpired()) { idleLogout(); return; }   // 已經超時才回來操作：不延長，直接登出
     if (now - lastActiveAt() >= 1000) {   // 連續操作時最多每秒寫入一次
         try { localStorage.setItem(ACTIVE_KEY, String(now)); } catch (e) { /* 忽略 */ }
+        showIdleCountdown();
     }
     if (now - lastRenewAt >= RENEW_EVERY_MS) {
         lastRenewAt = now;
@@ -108,7 +109,18 @@ function idleLogout() {
 function checkIdle() {
     if (redirectingToLogin) return;
     if (!getSession()) { goLogin(); return; }        // 已在其他分頁登出
-    if (isIdleExpired()) idleLogout();
+    if (isIdleExpired()) { idleLogout(); return; }
+    showIdleCountdown();
+}
+
+/** 在登入者列顯示「4:32 後自動登出」，剩不到 1 分鐘時變紅色 */
+function showIdleCountdown() {
+    const el = document.querySelector(".idle-timer");
+    if (!el) return;
+    const last = lastActiveAt() || Date.now();
+    const left = Math.max(0, Math.ceil((IDLE_LIMIT_MS - (Date.now() - last)) / 1000));
+    el.textContent = "⏱ " + Math.floor(left / 60) + ":" + String(left % 60).padStart(2, "0") + " 後自動登出";
+    el.style.color = left < 60 ? "#dc3545" : "#888";
 }
 
 let idleWatchStarted = false;
@@ -119,7 +131,7 @@ function startIdleWatch() {
     markActive();   // 開啟頁面算一次操作
     ["pointerdown", "keydown", "touchstart"].forEach(type =>
         document.addEventListener(type, markActive, { capture: true, passive: true }));
-    setInterval(checkIdle, 5000);
+    setInterval(checkIdle, 1000);   // 每秒檢查一次並更新倒數顯示
     // 手機從背景切回來時立刻檢查，不必等計時器
     document.addEventListener("visibilitychange", () => { if (!document.hidden) checkIdle(); });
 }
@@ -184,7 +196,7 @@ async function logout() {
     location.replace(LOGIN_PAGE);
 }
 
-/** 在指定元素顯示「姓名（職稱） 登出」 */
+/** 在指定元素顯示「姓名（職稱） 登出」，下一行顯示自動登出的倒數 */
 function renderUserBar(el, session) {
     el.textContent = "";
     const who = document.createElement("span");
@@ -194,5 +206,10 @@ function renderUserBar(el, session) {
     btn.className = "logout-btn";
     btn.textContent = "登出";
     btn.addEventListener("click", () => { btn.disabled = true; logout(); });
-    el.append(who, btn);
+    const timer = document.createElement("span");
+    timer.className = "idle-timer";
+    timer.style.cssText = "flex-basis:100%;text-align:center;font-size:13px;color:#888;";
+    el.style.flexWrap = "wrap";
+    el.append(who, btn, timer);
+    showIdleCountdown();
 }
